@@ -173,7 +173,7 @@ def test_openai_responses_preflight_compresses_oversized_output_without_executor
 
     assert modified is True
     assert saved > 0
-    assert attempted > 0
+    assert attempted == TokenCounter().count_text(payload["input"][0]["output"])
     assert reason is None
     assert before > after
     assert "Retrieve more: hash=" in compressed_output
@@ -181,37 +181,38 @@ def test_openai_responses_preflight_compresses_oversized_output_without_executor
     assert "compression_inline_live_text" in timing
 
 
-def test_openai_responses_preflight_compresses_router_sized_output_without_executor():
+def test_openai_responses_preflight_does_not_call_stuck_router(monkeypatch):
     reset_compression_store()
     router = ContentRouter()
 
-    def router_must_not_run(self, content: str, **_kwargs):
-        raise AssertionError("Responses live output should use bounded inline CCR")
+    def compress(self, content: str, **_kwargs):
+        raise AssertionError("Responses live output should not enter router")
 
-    router.compress = MethodType(router_must_not_run, router)
+    router.compress = MethodType(compress, router)
     handler = _handler_with_router(router)
     payload = {
         "model": "gpt-5",
         "input": [
             {
                 "type": "local_shell_call_output",
-                "call_id": "call-router-sized-inline",
-                "output": " ".join(f"line-{idx}" for idx in range(1200)),
-            }
+                "call_id": "call-stuck-router-proof",
+                "output": " ".join(f"large-line-{idx}" for idx in range(1200)),
+            },
         ],
     }
 
     async def must_not_submit(*_args, **_kwargs):
-        raise AssertionError("Responses live output should not enter executor")
+        raise AssertionError("Responses live output should not enter proxy executor")
 
     handler._run_compression_in_executor = must_not_submit
 
     async def run():
-        return await handler._compress_openai_responses_payload_in_executor(
-            payload,
-            model="gpt-5",
-            request_id="req_router_sized_inline",
-        )
+        with anyio.fail_after(1):
+            return await handler._compress_openai_responses_payload_in_executor(
+                payload,
+                model="gpt-5",
+                request_id="req_stuck_router_proof",
+            )
 
     new_payload, modified, saved, transforms, reason, before, after, attempted, timing = (
         anyio.run(run)
@@ -221,11 +222,68 @@ def test_openai_responses_preflight_compresses_router_sized_output_without_execu
 
     assert modified is True
     assert saved > 0
-    assert attempted > 0
+    assert attempted == TokenCounter().count_text(payload["input"][0]["output"])
     assert reason is None
     assert before > after
     assert "Retrieve more: hash=" in compressed_output
     assert "openai:responses:large_text_ccr" in transforms
+    assert "compression_inline_live_text" in timing
+
+
+def test_openai_responses_preflight_compresses_medium_output_without_router():
+    reset_compression_store()
+    router = ContentRouter()
+
+    def router_must_not_run(self, content: str, **_kwargs):
+        raise AssertionError("medium Responses live output should not enter router")
+
+    router.compress = MethodType(router_must_not_run, router)
+    handler = _handler_with_router(router)
+    original_output = " ".join(f"medium-{idx}" for idx in range(70))
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "local_shell_call_output",
+                "call_id": "call-medium",
+                "output": original_output,
+            }
+        ],
+    }
+
+    async def must_not_submit(*_args, **_kwargs):
+        raise AssertionError("Responses live output should not enter proxy executor")
+
+    handler._run_compression_in_executor = must_not_submit
+
+    async def run():
+        with anyio.fail_after(1):
+            return await handler._compress_openai_responses_payload_in_executor(
+                payload,
+                model="gpt-5",
+                request_id="req_medium_adaptive_ccr",
+            )
+
+    new_payload, modified, saved, transforms, reason, before, after, attempted, timing = (
+        anyio.run(run)
+    )
+
+    compressed_output = new_payload["input"][0]["output"]
+    marker = "Retrieve more: hash="
+    hash_key = compressed_output.split(marker, 1)[1].split("]", 1)[0]
+    entry = get_compression_store().retrieve(hash_key)
+
+    assert modified is True
+    assert saved > 0
+    assert "openai:responses:large_text_ccr" in transforms
+    assert reason is None
+    assert before > after
+    assert attempted == TokenCounter().count_text(original_output)
+    assert marker in compressed_output
+    assert len(compressed_output) < len(original_output)
+    assert entry is not None
+    assert entry.original_content == original_output
+    assert entry.tool_call_id == "call-medium"
     assert "compression_inline_live_text" in timing
 
 
