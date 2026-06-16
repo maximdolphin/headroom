@@ -2016,7 +2016,10 @@ class OpenAIHandlerMixin:
                 if result.waste_signals:
                     waste_signals_dict = result.waste_signals.to_dict()
             except Exception as e:
-                logger.warning(f"Optimization failed: {e}")
+                logger.warning(
+                    f"Optimization failed: {type(e).__name__}: {e}",
+                    exc_info=True,
+                )
                 # Flag compression failure for observability
                 _compression_failed = True
 
@@ -3938,7 +3941,20 @@ class OpenAIHandlerMixin:
                         open_timeout=max(30, self.config.connect_timeout_seconds * 3),
                         close_timeout=10,
                         ping_interval=20,
-                        ping_timeout=20,
+                        # Image-generation turns go silent for 20-60s while the
+                        # model renders (a single ``image_generation_call`` event,
+                        # then a long quiet gap with no data frames). A 20s pong
+                        # deadline false-kills the still-healthy upstream
+                        # mid-render with ``upstream_error`` before the image
+                        # lands. Keep ``ping_interval`` for NAT keepalive but do
+                        # not tear the session down on a missing pong.
+                        ping_timeout=None,
+                        # The finished image arrives inline as a single base64
+                        # frame that exceeds the websockets default 1 MiB cap,
+                        # raising ``PayloadTooBig`` exactly as the image lands.
+                        # The relay must accept frames as large as the endpoints
+                        # do, so do not cap the upstream payload size.
+                        max_size=None,
                     )
                     ws_connected = True
                     if not _upstream_connect_recorded:
